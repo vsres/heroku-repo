@@ -1,4 +1,4 @@
-require "tempfile"
+require "vendor/heroku/okjson"
 
 # Slug manipulation
 class Heroku::Command::Repo < Heroku::Command::BaseWithApp
@@ -12,27 +12,26 @@ class Heroku::Command::Repo < Heroku::Command::BaseWithApp
 set -e
 mkdir -p tmp/repo_tmp/unpack
 cd tmp/repo_tmp
-curl -o repo-cache.tgz '#{cache_get_url}'
+curl -o repo.tgz '#{repo_get_url}'
 cd unpack
-tar -zxf ../repo-cache.tgz
-METADATA="vendor/heroku"
+tar -zxf ../repo.tgz
+METADATA=".cache/vendor/heroku"
 if [ -d "$METADATA" ]; then
   TMPDIR=`mktemp -d`
   cp -rf $METADATA $TMPDIR
 fi
-cd ..
-rm -rf unpack
-mkdir unpack
-cd unpack
+rm -rf .cache
+mkdir .cache
 TMPDATA="$TMPDIR/heroku"
-VENDOR="vendor"
+VENDOR=".cache/vendor"
 if [ -d "$TMPDATA" ]; then
   mkdir $VENDOR
   cp -rf $TMPDATA $VENDOR
   rm -rf $TMPDIR
 fi
-tar -zcf ../cache-repack.tgz .
-curl -o /dev/null --upload-file ../cache-repack.tgz '#{cache_put_url}'
+tar -zcf ../repack.tgz .
+curl -o /dev/null --upload-file ../repack.tgz '#{repo_put_url}'
+curl --request DELETE '#{cache_delete_url}'
 exit
 EOF
   end
@@ -50,7 +49,7 @@ cd tmp/repo_tmp
 curl -o repo.tgz '#{repo_get_url}'
 cd unpack
 tar -zxf ../repo.tgz
-git gc --aggressive
+git gc
 tar -zcf ../repack.tgz .
 curl -o /dev/null --upload-file ../repack.tgz '#{repo_put_url}'
 exit
@@ -69,16 +68,13 @@ EOF
   #
   # Sets the bare repo for immediate consumption
   def clone
-    # Obtain the url from API before doing fs side effects
-    repo_url = repo_get_url
-
     if File.exist?(app)
       puts "#{app} already exists in the filesystem; aborting."
       return
     end
     FileUtils.mkdir_p("#{app}/.git")
     Dir.chdir("#{app}/.git")
-    system("curl '#{repo_url}' | tar xzf -")
+    system("curl '#{repo_get_url}' | tar xzf -")
     Dir.chdir("..")
     system("git init")
     system("git reset --hard master")
@@ -87,7 +83,7 @@ EOF
 
   # repo:reset
   #
-  # Reset the repo
+  # Reset the repo and cache
   def reset
     run <<EOF
 set -e
@@ -100,25 +96,22 @@ exit
 EOF
   end
 
-  private
-
-  def cache_get_url
-    release['cache_get_url']
+  # repo:rebuild
+  #
+  # Force a rebuild of the master branch
+  def rebuild
+    reset
+    system "git push #{extract_app_from_git_config || "heroku"} master"
   end
 
-  def cache_put_url
-    release['cache_put_url']
+  private
+
+  def cache_delete_url
+    release['cache_delete_url']
   end
 
   def release
-    @release ||= api.request(
-      :method  => "get",
-      :expects => 200,
-      :path    => "/apps/#{app}/releases/new",
-      :headers => {
-        "Accept" => "application/vnd.heroku+json; version=2",
-      }
-    ).body
+    @release ||= Heroku::OkJson.decode(heroku.get('/apps/' + app + '/releases/new'))
   end
 
   def repo_get_url
@@ -130,26 +123,17 @@ EOF
   end
 
   def run(cmds)
-    require 'open3'
-    Open3.popen3("heroku run bash -a #{app} --exit-code") do |stdin, stdout, stderr, wait_thr|
-      stdin.write(cmds)
-      until [stdout, stderr].all? {|f| f.eof?}
-        ready = IO.select([stderr, stdout])
-        if ready
-          readable = ready[0]
-          readable.each do |f|
-            begin
-              if f == stdout
-                $stdout.write f.read(50)
-              else
-                $stderr.write f.read(50)
-              end
-            rescue EOFError
-            end
-          end
-        end
-      end
-      exit wait_thr.value.exitstatus
+    tmpfile = Tempfile.new('heroku-repo')
+    begin
+      tmpfile.write(cmds)
+      tmpfile.close
+      real_stdin = $stdin
+      $stdin = File.open(tmpfile.path, 'r')
+      Heroku::Command::Run.new(["bash"], :app => app).index
+      $stdin = real_stdin
+    ensure
+      tmpfile.close
+      tmpfile.unlink
     end
   end
 end
